@@ -1301,8 +1301,7 @@ fn prepare_columns(
     }
 }
 
-#[no_mangle]
-pub extern "C" fn hosted_sqlite_open(
+fn sqlite_open_live(
     path: HostSqliteOpenArg0,
     max_connections: u64,
     acquire_timeout_ms: u64,
@@ -1345,8 +1344,7 @@ pub extern "C" fn hosted_sqlite_open(
     }
 }
 
-#[no_mangle]
-pub extern "C" fn hosted_sqlite_prepare(
+fn sqlite_prepare_live(
     database_handle: *mut u64,
     query: RocStr,
 ) -> SqliteHostPrepareResult {
@@ -1396,8 +1394,7 @@ fn prepare_logical_statement(
     }))
 }
 
-#[no_mangle]
-pub extern "C" fn hosted_sqlite_columns(handle: *mut u64) -> SqliteHostColumnsResult {
+fn sqlite_columns_live(handle: *mut u64) -> SqliteHostColumnsResult {
     let roc_host = roc_host();
     let columns = match unsafe { sqlite_stmt_ref(handle) } {
         Ok(statement) => Arc::clone(&statement.columns),
@@ -1544,8 +1541,7 @@ fn start_transaction_execution(
     })
 }
 
-#[no_mangle]
-pub extern "C" fn hosted_sqlite_start(
+fn sqlite_start_live(
     statement_handle: *mut u64,
     bindings: RocList<SqliteBindings>,
     timeout_ms: u64,
@@ -1587,8 +1583,7 @@ pub extern "C" fn hosted_sqlite_start(
     }
 }
 
-#[no_mangle]
-pub extern "C" fn hosted_sqlite_next_row(
+fn sqlite_next_row_live(
     handle: *mut u64,
     max_bytes: u64,
     allow_row: bool,
@@ -1645,8 +1640,7 @@ pub extern "C" fn hosted_sqlite_next_row(
     result
 }
 
-#[no_mangle]
-pub extern "C" fn hosted_sqlite_begin(
+fn sqlite_begin_live(
     database_handle: *mut u64,
     mode: i64,
 ) -> SqliteHostBeginResult {
@@ -1702,8 +1696,7 @@ pub extern "C" fn hosted_sqlite_begin(
     try_sqlite_begin_ok(reservation.insert(transaction))
 }
 
-#[no_mangle]
-pub extern "C" fn hosted_sqlite_txn_prepare(
+fn sqlite_txn_prepare_live(
     transaction_handle: *mut u64,
     query: RocStr,
 ) -> SqliteHostPrepareResult {
@@ -1727,8 +1720,7 @@ pub extern "C" fn hosted_sqlite_txn_prepare(
     )
 }
 
-#[no_mangle]
-pub extern "C" fn hosted_sqlite_txn_finish(
+fn sqlite_txn_finish_live(
     transaction_handle: *mut u64,
     commit: bool,
 ) -> SqliteHostTxnFinishResult {
@@ -1773,6 +1765,257 @@ pub extern "C" fn hosted_sqlite_txn_finish(
     drop(state);
     transaction.pool.release(connection);
     try_sqlite_finish_ok()
+}
+
+// ---------------------------------------------------------------- ledger
+
+// Each hosted SQLite function crosses the effect ledger (see ledger.rs). When
+// recording, the real call runs and its response is recorded. When replaying,
+// the recorded response is returned and no SQLite resource is ever touched:
+// arguments are only released, and new handles are stand-ins.
+
+use crate::ledger::{self, SqlErr, SqlStep, SqlValue};
+use effect_ledger::Cross;
+
+fn sql_err(error: &SqliteError) -> SqlErr {
+    (error.code, error.message.as_str().to_owned())
+}
+
+fn roc_sql_err((code, message): SqlErr) -> SqliteError {
+    sqlite_error(code as c_int, &message, roc_host())
+}
+
+fn sql_value(value: &SqliteValue) -> SqlValue {
+    unsafe {
+        match value.tag {
+            SqliteValueTag::Null => SqlValue::Null,
+            SqliteValueTag::Real => SqlValue::Real(*value.payload.real),
+            SqliteValueTag::Integer => SqlValue::Integer(*value.payload.integer),
+            SqliteValueTag::String => SqlValue::String(value.payload.string.as_str().to_owned()),
+            SqliteValueTag::Bytes => SqlValue::Bytes(value.payload.bytes.as_slice().to_vec()),
+        }
+    }
+}
+
+fn roc_sql_value(value: SqlValue, roc_host: &RocHost) -> SqliteValue {
+    match value {
+        SqlValue::Null => sqlite_value_null(),
+        SqlValue::Real(r) => sqlite_value_real(r),
+        SqlValue::Integer(n) => sqlite_value_integer(n),
+        SqlValue::String(t) => sqlite_value_string(RocStr::from_str(&t, roc_host)),
+        SqlValue::Bytes(b) => sqlite_value_bytes(unsafe { RocListWith::from_slice(&b, roc_host) }),
+    }
+}
+
+/// The handle a handle-returning result carries, or its error.
+macro_rules! new_handle {
+    ($result:expr, $tag:ident) => {
+        match $result.tag {
+            $tag::Ok => Ok(unsafe { *$result.payload.ok }),
+            $tag::Err => Err(sql_err(unsafe { &$result.payload.err })),
+        }
+    };
+}
+
+/// A handle-returning result rebuilt from its recorded response.
+macro_rules! replayed_handle {
+    ($response:expr, $ok:ident, $err:ident) => {
+        match ledger::decode_new_handle(&$response) {
+            Ok(handle) => $ok(handle),
+            Err(error) => $err(roc_sql_err(error)),
+        }
+    };
+}
+
+#[no_mangle]
+pub extern "C" fn hosted_sqlite_open(
+    path: HostSqliteOpenArg0,
+    max_connections: u64,
+    acquire_timeout_ms: u64,
+    busy_timeout_ms: u64,
+    max_cached_statements: u64,
+    journal_mode: i64,
+    synchronous: i64,
+) -> SqliteHostOpenResult {
+    let settings = [max_connections, acquire_timeout_ms, busy_timeout_ms, max_cached_statements, journal_mode as u64, synchronous as u64];
+    let request = || ledger::encode_sqlite_open(path.is_windows, path.unix_bytes.as_slice(), path.windows_u16s.as_slice(), settings);
+    match effect_ledger::cross("hosted_sqlite_open", request) {
+        Cross::Replay(response) => {
+            unsafe { path.decref(roc_host()) };
+            replayed_handle!(response, try_sqlite_open_ok, try_sqlite_open_err)
+        }
+        live => {
+            let result = sqlite_open_live(path, max_connections, acquire_timeout_ms, busy_timeout_ms, max_cached_statements, journal_mode, synchronous);
+            live.record(|| ledger::encode_new_handle(new_handle!(result, SqliteHostOpenResultTag)));
+            result
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn hosted_sqlite_prepare(database_handle: *mut u64, query: RocStr) -> SqliteHostPrepareResult {
+    match effect_ledger::cross("hosted_sqlite_prepare", || ledger::encode_handle_sql(database_handle, query.as_str())) {
+        Cross::Replay(response) => {
+            release_resource_handle(database_handle, roc_host());
+            unsafe { query.decref(roc_host()) };
+            replayed_handle!(response, try_sqlite_prepare_ok, try_sqlite_prepare_err)
+        }
+        live => {
+            let result = sqlite_prepare_live(database_handle, query);
+            live.record(|| ledger::encode_new_handle(new_handle!(result, SqliteHostPrepareResultTag)));
+            result
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn hosted_sqlite_columns(handle: *mut u64) -> SqliteHostColumnsResult {
+    match effect_ledger::cross("hosted_sqlite_columns", || ledger::encode_handle(handle)) {
+        Cross::Replay(response) => {
+            let roc_host = roc_host();
+            release_resource_handle(handle, roc_host);
+            match ledger::decode_columns(&response) {
+                Ok(names) => {
+                    let names: Vec<RocStr> = names.iter().map(|name| RocStr::from_str(name, roc_host)).collect();
+                    try_sqlite_columns_ok(unsafe { RocList::from_slice(&names, roc_host) })
+                }
+                Err(error) => try_sqlite_columns_err(roc_sql_err(error)),
+            }
+        }
+        live => {
+            let result = sqlite_columns_live(handle);
+            live.record(|| {
+                ledger::encode_columns(&match result.tag {
+                    SqliteHostColumnsResultTag::Ok => Ok(unsafe { result.payload.ok.as_slice() }.iter().map(|name| name.as_str().to_owned()).collect()),
+                    SqliteHostColumnsResultTag::Err => Err(sql_err(unsafe { &result.payload.err })),
+                })
+            });
+            result
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn hosted_sqlite_start(
+    statement_handle: *mut u64,
+    bindings: RocList<SqliteBindings>,
+    timeout_ms: u64,
+) -> SqliteHostStartResult {
+    let request = || {
+        let named: Vec<(String, SqlValue)> = bindings.as_slice().iter().map(|b| (b.name.as_str().to_owned(), sql_value(&b.value))).collect();
+        ledger::encode_sqlite_start(statement_handle, &named, timeout_ms)
+    };
+    match effect_ledger::cross("hosted_sqlite_start", request) {
+        Cross::Replay(response) => {
+            release_resource_handle(statement_handle, roc_host());
+            release_bindings(&bindings, roc_host());
+            replayed_handle!(response, try_sqlite_start_ok, try_sqlite_start_err)
+        }
+        live => {
+            let result = sqlite_start_live(statement_handle, bindings, timeout_ms);
+            live.record(|| ledger::encode_new_handle(new_handle!(result, SqliteHostStartResultTag)));
+            result
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn hosted_sqlite_next_row(handle: *mut u64, max_bytes: u64, allow_row: bool) -> SqliteHostNextRowResult {
+    match effect_ledger::cross("hosted_sqlite_next_row", || ledger::encode_handle_args(handle, &[max_bytes, allow_row as u64])) {
+        Cross::Replay(response) => {
+            let roc_host = roc_host();
+            release_resource_handle(handle, roc_host);
+            match ledger::decode_step(&response) {
+                Ok(SqlStep::Done) => sqlite_next_done(),
+                Ok(SqlStep::ResultTooLarge) => sqlite_next_result_too_large(),
+                Ok(SqlStep::RowLimitExceeded) => sqlite_next_row_limit_exceeded(),
+                Ok(SqlStep::Row { bytes, values }) => {
+                    let values: Vec<SqliteValue> = values.into_iter().map(|v| roc_sql_value(v, roc_host)).collect();
+                    sqlite_next_row(unsafe { RocList::from_slice(&values, roc_host) }, bytes)
+                }
+                Err(error) => try_sqlite_next_err(roc_sql_err(error)),
+            }
+        }
+        live => {
+            let result = sqlite_next_row_live(handle, max_bytes, allow_row);
+            live.record(|| ledger::encode_step(&sql_step(&result)));
+            result
+        }
+    }
+}
+
+fn sql_step(result: &SqliteHostNextRowResult) -> Result<SqlStep, SqlErr> {
+    unsafe {
+        match result.tag {
+            SqliteHostNextRowResultTag::Err => Err(sql_err(&result.payload.err)),
+            SqliteHostNextRowResultTag::Ok => {
+                let state = &*result.payload.ok;
+                Ok(match state.tag {
+                    SqliteHostNextRowStateTag::Done => SqlStep::Done,
+                    SqliteHostNextRowStateTag::ResultTooLarge => SqlStep::ResultTooLarge,
+                    SqliteHostNextRowStateTag::RowLimitExceeded => SqlStep::RowLimitExceeded,
+                    SqliteHostNextRowStateTag::Row => {
+                        let row = &*state.payload.row;
+                        SqlStep::Row { bytes: row.bytes, values: row.values.as_slice().iter().map(sql_value).collect() }
+                    }
+                })
+            }
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn hosted_sqlite_begin(database_handle: *mut u64, mode: i64) -> SqliteHostBeginResult {
+    match effect_ledger::cross("hosted_sqlite_begin", || ledger::encode_handle_args(database_handle, &[mode as u64])) {
+        Cross::Replay(response) => {
+            release_resource_handle(database_handle, roc_host());
+            replayed_handle!(response, try_sqlite_begin_ok, try_sqlite_begin_err)
+        }
+        live => {
+            let result = sqlite_begin_live(database_handle, mode);
+            live.record(|| ledger::encode_new_handle(new_handle!(result, SqliteHostBeginResultTag)));
+            result
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn hosted_sqlite_txn_prepare(transaction_handle: *mut u64, query: RocStr) -> SqliteHostPrepareResult {
+    match effect_ledger::cross("hosted_sqlite_txn_prepare", || ledger::encode_handle_sql(transaction_handle, query.as_str())) {
+        Cross::Replay(response) => {
+            release_resource_handle(transaction_handle, roc_host());
+            unsafe { query.decref(roc_host()) };
+            replayed_handle!(response, try_sqlite_prepare_ok, try_sqlite_prepare_err)
+        }
+        live => {
+            let result = sqlite_txn_prepare_live(transaction_handle, query);
+            live.record(|| ledger::encode_new_handle(new_handle!(result, SqliteHostPrepareResultTag)));
+            result
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn hosted_sqlite_txn_finish(transaction_handle: *mut u64, commit: bool) -> SqliteHostTxnFinishResult {
+    match effect_ledger::cross("hosted_sqlite_txn_finish", || ledger::encode_handle_args(transaction_handle, &[commit as u64])) {
+        Cross::Replay(response) => {
+            release_resource_handle(transaction_handle, roc_host());
+            match ledger::decode_sql_unit(&response) {
+                Ok(()) => try_sqlite_finish_ok(),
+                Err(error) => try_sqlite_finish_err(roc_sql_err(error)),
+            }
+        }
+        live => {
+            let result = sqlite_txn_finish_live(transaction_handle, commit);
+            live.record(|| {
+                ledger::encode_sql_unit(&match result.tag {
+                    SqliteHostTxnFinishResultTag::Ok => Ok(()),
+                    SqliteHostTxnFinishResultTag::Err => Err(sql_err(unsafe { &result.payload.err })),
+                })
+            });
+            result
+        }
+    }
 }
 
 #[cfg(test)]

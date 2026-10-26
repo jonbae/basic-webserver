@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 use effect_ledger::{iso_utc, Boundary, Echo, Entry, Hosted};
 
 use crate::abi::{roc_host, ServerHeader, ServerRequest, ServerResponse, ServerResponseTag, ServerShutdownReason};
+use crate::request_body::BodyError;
 use crate::roc_platform_abi::*;
 
 pub static BOUNDARY: Boundary = Boundary {
@@ -23,6 +24,15 @@ pub static BOUNDARY: Boundary = Boundary {
         Hosted { symbol: "hosted_unix_time_now", echo: Echo::Nothing, show_request: |_| String::new(), show_response: show_unix_time },
         Hosted { symbol: "hosted_sleep_millis", echo: Echo::Nothing, show_request: |r| u64::from_le_bytes(r.try_into().unwrap()).to_string(), show_response: |_| "{}".into() },
         Hosted { symbol: "hosted_file_read_utf8", echo: Echo::Nothing, show_request: show_raw_path, show_response: show_str_result },
+        Hosted { symbol: "hosted_request_body_read_all", echo: Echo::Nothing, show_request: show_body_limit, show_response: show_body },
+        Hosted { symbol: "hosted_sqlite_open", echo: Echo::Nothing, show_request: show_sqlite_open, show_response: show_new_handle },
+        Hosted { symbol: "hosted_sqlite_prepare", echo: Echo::Nothing, show_request: show_handle_sql, show_response: show_new_handle },
+        Hosted { symbol: "hosted_sqlite_columns", echo: Echo::Nothing, show_request: show_handle, show_response: show_columns },
+        Hosted { symbol: "hosted_sqlite_start", echo: Echo::Nothing, show_request: show_sqlite_start, show_response: show_new_handle },
+        Hosted { symbol: "hosted_sqlite_next_row", echo: Echo::Nothing, show_request: show_next_row, show_response: show_step },
+        Hosted { symbol: "hosted_sqlite_begin", echo: Echo::Nothing, show_request: show_begin, show_response: show_new_handle },
+        Hosted { symbol: "hosted_sqlite_txn_prepare", echo: Echo::Nothing, show_request: show_handle_sql, show_response: show_new_handle },
+        Hosted { symbol: "hosted_sqlite_txn_finish", echo: Echo::Nothing, show_request: show_txn_finish, show_response: show_sql_unit },
     ],
     entries: &[
         Entry { name: "init!", after: &[], replay: replay_init, ok: |r| r[0] == 0, show_request: |_| String::new(), show_response: show_exit_result },
@@ -64,6 +74,30 @@ impl Out {
         }
         out
     }
+    fn raw_path(self, is_windows: bool, unix: &[u8], windows: &[u16]) -> Self {
+        let units: Vec<u8> = windows.iter().flat_map(|u| u.to_le_bytes()).collect();
+        self.u8(is_windows as u8).bytes(unix).bytes(&units)
+    }
+    /// A handle crosses as the name of the crossing that created it.
+    fn handle(self, handle: *mut u64) -> Self {
+        self.str(&effect_ledger::handle::name(handle as usize))
+    }
+    fn value(self, value: &SqlValue) -> Self {
+        match value {
+            SqlValue::Null => self.u8(0),
+            SqlValue::Real(r) => self.u8(1).u64(r.to_bits()),
+            SqlValue::Integer(n) => self.u8(2).u64(*n as u64),
+            SqlValue::String(t) => self.u8(3).str(t),
+            SqlValue::Bytes(b) => self.u8(4).bytes(b),
+        }
+    }
+    /// 0 + what `ok` writes | 1 + the SQLite error's code and message.
+    fn sql<T>(self, result: &Result<T, SqlErr>, ok: impl FnOnce(Self, &T) -> Self) -> Self {
+        match result {
+            Ok(v) => ok(self.u8(0), v),
+            Err((code, message)) => self.u8(1).u64(*code as u64).str(message),
+        }
+    }
 }
 
 struct In<'a>(&'a [u8]);
@@ -92,6 +126,32 @@ impl In<'_> {
     }
     fn headers(&mut self) -> Vec<(String, String)> {
         (0..self.u64()).map(|_| (self.str(), self.str())).collect()
+    }
+    fn raw_path(&mut self) -> String {
+        let is_windows = self.u8() != 0;
+        let unix = self.bytes();
+        let windows = self.bytes();
+        if is_windows {
+            let units: Vec<u16> = windows.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+            format!("{{ windows: {:?} }}", String::from_utf16_lossy(&units))
+        } else {
+            format!("{{ unix: {:?} }}", String::from_utf8_lossy(&unix))
+        }
+    }
+    fn value(&mut self) -> SqlValue {
+        match self.u8() {
+            0 => SqlValue::Null,
+            1 => SqlValue::Real(f64::from_bits(self.u64())),
+            2 => SqlValue::Integer(self.u64() as i64),
+            3 => SqlValue::String(self.str()),
+            _ => SqlValue::Bytes(self.bytes()),
+        }
+    }
+    fn sql<T>(&mut self, ok: impl FnOnce(&mut Self) -> T) -> Result<T, SqlErr> {
+        match self.u8() {
+            0 => Ok(ok(self)),
+            _ => Err((self.u64() as i64, self.str())),
+        }
     }
 }
 
@@ -158,8 +218,174 @@ pub fn decode_str_result(bytes: &[u8]) -> io::Result<String> {
 
 /// A `RawPath` argument as Roc holds it: is_windows, unix bytes, windows u16s.
 pub fn encode_raw_path(path: &HostFileReadUtf8Args) -> Vec<u8> {
-    let units: Vec<u8> = path.windows_u16s.as_slice().iter().flat_map(|u| u.to_le_bytes()).collect();
-    Out::default().u8(path.is_windows as u8).bytes(path.unix_bytes.as_slice()).bytes(&units).0
+    Out::default().raw_path(path.is_windows, path.unix_bytes.as_slice(), path.windows_u16s.as_slice()).0
+}
+
+/// `hosted_request_body_read_all` request: the limit. The body capability is
+/// left out, as in the `respond!` request: a request has one body.
+pub fn encode_body_limit(limit: u64) -> Vec<u8> {
+    Out::default().u64(limit).0
+}
+
+// The BodyError variants, in a fixed order: the byte is the index.
+const BODY_TOO_LARGE: u8 = 0;
+const BODY_INVALID: u8 = 3;
+
+/// `hosted_request_body_read_all` response: 0 + the bytes | 1 + the error.
+pub fn encode_body(result: Result<&[u8], &BodyError>) -> Vec<u8> {
+    let out = Out::default();
+    match result {
+        Ok(bytes) => out.u8(0).bytes(bytes),
+        Err(error) => match error {
+            BodyError::TooLarge { limit_bytes, received_at_least } => out.u8(1).u8(BODY_TOO_LARGE).u64(*limit_bytes).u64(*received_at_least),
+            BodyError::Timeout => out.u8(1).u8(1),
+            BodyError::ClientDisconnected => out.u8(1).u8(2),
+            BodyError::InvalidBody(detail) => out.u8(1).u8(BODY_INVALID).str(detail),
+            BodyError::RequestFinished => out.u8(1).u8(4),
+            BodyError::ConcurrentRead => out.u8(1).u8(5),
+            BodyError::Cancelled => out.u8(1).u8(6),
+            BodyError::Stopping => out.u8(1).u8(7),
+        },
+    }
+    .0
+}
+
+pub fn decode_body(bytes: &[u8]) -> Result<Vec<u8>, BodyError> {
+    let mut i = In(bytes);
+    if i.u8() == 0 {
+        return Ok(i.bytes());
+    }
+    Err(match i.u8() {
+        BODY_TOO_LARGE => BodyError::TooLarge { limit_bytes: i.u64(), received_at_least: i.u64() },
+        1 => BodyError::Timeout,
+        2 => BodyError::ClientDisconnected,
+        BODY_INVALID => BodyError::InvalidBody(i.str()),
+        4 => BodyError::RequestFinished,
+        5 => BodyError::ConcurrentRead,
+        6 => BodyError::Cancelled,
+        _ => BodyError::Stopping,
+    })
+}
+
+// ---------------------------------------------------------------- sqlite codecs
+
+// SQLite handles never cross as addresses. A handle argument crosses as the
+// name of the crossing that created it (effect_ledger::handle), and a crossing
+// that creates one records that name as its response.
+
+/// A SQLite value as the core sees it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlValue {
+    Null,
+    Real(f64),
+    Integer(i64),
+    String(String),
+    Bytes(Vec<u8>),
+}
+
+/// What one `sqlite_next_row!` step found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlStep {
+    Done,
+    ResultTooLarge,
+    Row { bytes: u64, values: Vec<SqlValue> },
+    RowLimitExceeded,
+}
+
+/// A SQLite error's code and message.
+pub type SqlErr = (i64, String);
+
+/// `hosted_sqlite_open` request: the path, then the six pool settings.
+pub fn encode_sqlite_open(is_windows: bool, unix: &[u8], windows: &[u16], settings: [u64; 6]) -> Vec<u8> {
+    settings.iter().fold(Out::default().raw_path(is_windows, unix, windows), |out, s| out.u64(*s)).0
+}
+
+/// `hosted_sqlite_prepare` and `hosted_sqlite_txn_prepare` request.
+pub fn encode_handle_sql(handle: *mut u64, sql: &str) -> Vec<u8> {
+    Out::default().handle(handle).str(sql).0
+}
+
+/// `hosted_sqlite_columns` request.
+pub fn encode_handle(handle: *mut u64) -> Vec<u8> {
+    Out::default().handle(handle).0
+}
+
+/// `hosted_sqlite_start` request: the statement, each binding's name and
+/// value, then the timeout.
+pub fn encode_sqlite_start(handle: *mut u64, bindings: &[(String, SqlValue)], timeout_ms: u64) -> Vec<u8> {
+    let out = Out::default().handle(handle).u64(bindings.len() as u64);
+    bindings.iter().fold(out, |out, (name, value)| out.str(name).value(value)).u64(timeout_ms).0
+}
+
+/// `hosted_sqlite_next_row` (max bytes, allow row), `hosted_sqlite_begin`
+/// (mode) and `hosted_sqlite_txn_finish` (commit) request: the handle, then
+/// its numeric arguments.
+pub fn encode_handle_args(handle: *mut u64, args: &[u64]) -> Vec<u8> {
+    args.iter().fold(Out::default().handle(handle), |out, a| out.u64(*a)).0
+}
+
+/// A response that hands the core a new handle: 0 + its name | 1 + error.
+/// Recording names the real handle here, after this crossing.
+pub fn encode_new_handle(result: Result<*mut u64, SqlErr>) -> Vec<u8> {
+    Out::default().sql(&result, |out, handle| out.str(&effect_ledger::handle::created(*handle as usize))).0
+}
+
+/// Replay: a stand-in for the handle the recording got, named the same way.
+/// The real resource never exists. The core only passes the stand-in back to
+/// wrapped crossings and releases it, so nothing ever looks inside.
+pub fn decode_new_handle(bytes: &[u8]) -> Result<*mut u64, SqlErr> {
+    In(bytes).sql(|_| {
+        let handle = unsafe { allocate_box(8, 8, false, roc_host()) } as *mut u64;
+        unsafe { handle.write(0) };
+        effect_ledger::handle::created(handle as usize);
+        handle
+    })
+}
+
+/// `hosted_sqlite_columns` response: 0 + the names | 1 + error.
+pub fn encode_columns(result: &Result<Vec<String>, SqlErr>) -> Vec<u8> {
+    Out::default().sql(result, |out, names| names.iter().fold(out.u64(names.len() as u64), |out, n| out.str(n))).0
+}
+
+pub fn decode_columns(bytes: &[u8]) -> Result<Vec<String>, SqlErr> {
+    In(bytes).sql(|i| {
+        let n = i.u64();
+        (0..n).map(|_| i.str()).collect()
+    })
+}
+
+/// `hosted_sqlite_next_row` response: 0 + the step | 1 + error.
+pub fn encode_step(result: &Result<SqlStep, SqlErr>) -> Vec<u8> {
+    Out::default()
+        .sql(result, |out, step| match step {
+            SqlStep::Done => out.u8(0),
+            SqlStep::ResultTooLarge => out.u8(1),
+            SqlStep::Row { bytes, values } => values.iter().fold(out.u8(2).u64(*bytes).u64(values.len() as u64), |out, v| out.value(v)),
+            SqlStep::RowLimitExceeded => out.u8(3),
+        })
+        .0
+}
+
+pub fn decode_step(bytes: &[u8]) -> Result<SqlStep, SqlErr> {
+    In(bytes).sql(|i| match i.u8() {
+        0 => SqlStep::Done,
+        1 => SqlStep::ResultTooLarge,
+        2 => {
+            let bytes = i.u64();
+            let n = i.u64();
+            SqlStep::Row { bytes, values: (0..n).map(|_| i.value()).collect() }
+        }
+        _ => SqlStep::RowLimitExceeded,
+    })
+}
+
+/// `hosted_sqlite_txn_finish` response: 0 | 1 + error.
+pub fn encode_sql_unit(result: &Result<(), SqlErr>) -> Vec<u8> {
+    Out::default().sql(result, |out, _| out).0
+}
+
+pub fn decode_sql_unit(bytes: &[u8]) -> Result<(), SqlErr> {
+    In(bytes).sql(|_| ())
 }
 
 // ---------------------------------------------------------------- entries
@@ -324,16 +550,117 @@ fn show_unix_time(response: &[u8]) -> String {
 }
 
 fn show_raw_path(request: &[u8]) -> String {
-    let mut i = In(request);
-    let is_windows = i.u8() != 0;
-    let unix = i.bytes();
-    let windows = i.bytes();
-    if is_windows {
-        let units: Vec<u16> = windows.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
-        format!("{{ windows: {:?} }}", String::from_utf16_lossy(&units))
-    } else {
-        format!("{{ unix: {:?} }}", String::from_utf8_lossy(&unix))
+    In(request).raw_path()
+}
+
+fn show_body_limit(request: &[u8]) -> String {
+    In(request).u64().to_string()
+}
+
+fn show_body(response: &[u8]) -> String {
+    let error = match decode_body(response) {
+        Ok(bytes) => return format!("Ok({:?})", String::from_utf8_lossy(&bytes)),
+        Err(BodyError::TooLarge { limit_bytes, received_at_least }) => {
+            format!("TooLarge({{ limit_bytes: {limit_bytes}, received_at_least: {received_at_least} }})")
+        }
+        Err(BodyError::InvalidBody(detail)) => format!("InvalidBody({detail:?})"),
+        Err(BodyError::Timeout) => "Timeout".into(),
+        Err(BodyError::ClientDisconnected) => "ClientDisconnected".into(),
+        Err(BodyError::RequestFinished) => "RequestFinished".into(),
+        Err(BodyError::ConcurrentRead) => "ConcurrentRead".into(),
+        Err(BodyError::Cancelled) => "Cancelled".into(),
+        Err(BodyError::Stopping) => "Stopping".into(),
+    };
+    format!("Err({error})")
+}
+
+fn show_sql_err((code, message): SqlErr) -> String {
+    format!("Err({{ code: {code}, message: {message:?} }})")
+}
+
+fn show_sql<T>(result: Result<T, SqlErr>, ok: impl FnOnce(T) -> String) -> String {
+    match result {
+        Ok(v) => format!("Ok({})", ok(v)),
+        Err(e) => show_sql_err(e),
     }
+}
+
+fn show_value(value: &SqlValue) -> String {
+    match value {
+        SqlValue::Bytes(b) => format!("Bytes({} bytes)", b.len()),
+        other => format!("{other:?}"),
+    }
+}
+
+fn show_sqlite_open(request: &[u8]) -> String {
+    let mut i = In(request);
+    let path = i.raw_path();
+    let settings: Vec<String> = (0..6).map(|_| (i.u64() as i64).to_string()).collect();
+    format!("{path}, {}", settings.join(", "))
+}
+
+fn show_handle_sql(request: &[u8]) -> String {
+    let mut i = In(request);
+    let handle = i.str();
+    format!("{handle}, {:?}", i.str())
+}
+
+fn show_handle(request: &[u8]) -> String {
+    In(request).str()
+}
+
+fn show_sqlite_start(request: &[u8]) -> String {
+    let mut i = In(request);
+    let handle = i.str();
+    let n = i.u64();
+    let bindings: Vec<String> = (0..n).map(|_| format!("{} = {}", i.str(), show_value(&i.value()))).collect();
+    let bindings = if bindings.is_empty() { "{}".to_string() } else { format!("{{ {} }}", bindings.join(", ")) };
+    format!("{handle}, {bindings}, {} ms", i.u64())
+}
+
+fn show_next_row(request: &[u8]) -> String {
+    let mut i = In(request);
+    let handle = i.str();
+    let max_bytes = i.u64();
+    let allow_row = i.u64() != 0;
+    format!("{handle}, {max_bytes}, {allow_row}")
+}
+
+fn show_begin(request: &[u8]) -> String {
+    let mut i = In(request);
+    let handle = i.str();
+    let mode = match i.u64() {
+        0 => "Deferred",
+        1 => "Immediate",
+        2 => "Exclusive",
+        _ => "?",
+    };
+    format!("{handle}, {mode}")
+}
+
+fn show_txn_finish(request: &[u8]) -> String {
+    let mut i = In(request);
+    let handle = i.str();
+    format!("{handle}, {}", if i.u64() != 0 { "commit" } else { "rollback" })
+}
+
+fn show_new_handle(response: &[u8]) -> String {
+    show_sql(In(response).sql(|i| i.str()), |name| name)
+}
+
+fn show_columns(response: &[u8]) -> String {
+    show_sql(decode_columns(response), |names| format!("{names:?}"))
+}
+
+fn show_step(response: &[u8]) -> String {
+    show_sql(decode_step(response), |step| match step {
+        SqlStep::Row { values, .. } => format!("Row([{}])", values.iter().map(show_value).collect::<Vec<_>>().join(", ")),
+        other => format!("{other:?}"),
+    })
+}
+
+fn show_sql_unit(response: &[u8]) -> String {
+    show_sql(decode_sql_unit(response), |()| "{}".into())
 }
 
 fn show_str_result(response: &[u8]) -> String {
@@ -416,6 +743,45 @@ mod tests {
     fn shutdown_reason_shows_its_tag() {
         assert_eq!(show_shutdown_reason(&encode_shutdown_reason(2, "")), "Terminate");
         assert_eq!(show_shutdown_reason(&encode_shutdown_reason(4, "bind failed")), r#"Failed("bind failed")"#);
+    }
+
+    #[test]
+    fn sqlite_steps_round_trip() {
+        let row = Ok(SqlStep::Row {
+            bytes: 42,
+            values: vec![SqlValue::Null, SqlValue::Real(1.5), SqlValue::Integer(-3), SqlValue::String("milk".into()), SqlValue::Bytes(vec![0, 255])],
+        });
+        for step in [row, Ok(SqlStep::Done), Ok(SqlStep::ResultTooLarge), Ok(SqlStep::RowLimitExceeded), Err((19, "UNIQUE constraint failed".into()))] {
+            assert_eq!(decode_step(&encode_step(&step)), step);
+        }
+        assert_eq!(show_step(&encode_step(&Ok(SqlStep::Row { bytes: 9, values: vec![SqlValue::Integer(1), SqlValue::String("milk".into())] }))), r#"Ok(Row([Integer(1), String("milk")]))"#);
+    }
+
+    #[test]
+    fn sqlite_columns_and_units_round_trip() {
+        let columns = Ok(vec!["id".to_string(), "task".to_string()]);
+        assert_eq!(decode_columns(&encode_columns(&columns)), columns);
+        assert_eq!(decode_sql_unit(&encode_sql_unit(&Ok(()))), Ok(()));
+        assert_eq!(show_sql_unit(&encode_sql_unit(&Err((5, "busy".into())))), r#"Err({ code: 5, message: "busy" })"#);
+    }
+
+    #[test]
+    fn sqlite_requests_show_handles_by_name() {
+        let unnamed = 0x10 as *mut u64;
+        assert_eq!(show_handle_sql(&encode_handle_sql(unnamed, "SELECT 1;")), r#"?, "SELECT 1;""#);
+        let start = encode_sqlite_start(unnamed, &[(":task".into(), SqlValue::String("milk".into()))], 5000);
+        assert_eq!(show_sqlite_start(&start), r#"?, { :task = String("milk") }, 5000 ms"#);
+        assert_eq!(show_sqlite_start(&encode_sqlite_start(unnamed, &[], 5000)), "?, {}, 5000 ms");
+        assert_eq!(show_sqlite_open(&encode_sqlite_open(false, b"todos.db", &[], [4, 5000, 5000, 64, 1, 1])), r#"{ unix: "todos.db" }, 4, 5000, 5000, 64, 1, 1"#);
+    }
+
+    #[test]
+    fn body_reads_round_trip() {
+        assert!(matches!(decode_body(&encode_body(Ok(b"task=milk"))), Ok(b) if b == b"task=milk"));
+        let too_large = BodyError::TooLarge { limit_bytes: 16, received_at_least: 17 };
+        assert!(matches!(decode_body(&encode_body(Err(&too_large))), Err(BodyError::TooLarge { limit_bytes: 16, received_at_least: 17 })));
+        assert!(matches!(decode_body(&encode_body(Err(&BodyError::InvalidBody("x".into())))), Err(BodyError::InvalidBody(d)) if d == "x"));
+        assert_eq!(show_body(&encode_body(Err(&BodyError::Timeout))), "Err(Timeout)");
     }
 
     #[test]

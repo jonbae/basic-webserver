@@ -1094,8 +1094,21 @@ pub extern "C" fn hosted_request_body_read_all(
     handle: *mut u64,
     requested_limit: u64,
 ) -> BodyReadAllResult {
-    let body = OwnedBodyArgument::new(handle, roc_host());
-    match body.state().read_all(requested_limit, roc_host()) {
+    let result = match effect_ledger::cross("hosted_request_body_read_all", || crate::ledger::encode_body_limit(requested_limit)) {
+        effect_ledger::Cross::Replay(response) => {
+            // The handle is the stand-in a replayed respond! request carries,
+            // so release it as OwnedBodyArgument would, without validating it.
+            unsafe { decref_box_with(handle.cast(), core::mem::align_of::<u64>(), false, None, roc_host()) };
+            crate::ledger::decode_body(&response).map(|bytes| unsafe { RocListWith::from_slice(&bytes, roc_host()) })
+        }
+        live => {
+            let body = OwnedBodyArgument::new(handle, roc_host());
+            let result = body.state().read_all(requested_limit, roc_host());
+            live.record(|| crate::ledger::encode_body(result.as_ref().map(|bytes| bytes.as_slice())));
+            result
+        }
+    };
+    match result {
         Ok(bytes) => body_read_all_ok(bytes),
         Err(error) => body_read_all_error(to_host_error(error)),
     }
