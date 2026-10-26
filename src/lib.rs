@@ -26,6 +26,8 @@ mod host_resource;
 mod http;
 mod http_error;
 mod http_server;
+// PROTOTYPE: basic-webserver's binding to the effect-ledger library
+mod ledger;
 mod native_router;
 mod os_str;
 mod path;
@@ -54,8 +56,16 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const std::ffi::c_char) -> i32
 }
 
 pub fn rust_main() -> i32 {
+    // PROTOTYPE: a supervisor never runs Roc code; a ledger child carries on.
+    let process_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(code) = effect_ledger::start(&ledger::BOUNDARY, &process_args) {
+        return code;
+    }
     env::initialize_launch_dir();
     abi::initialize_roc_host();
+    if effect_ledger::replaying() {
+        return effect_ledger::serve_replay();
+    }
     #[cfg(feature = "benchmark-simulation")]
     let exit_code = benchmark_simulation::start();
     #[cfg(not(feature = "benchmark-simulation"))]

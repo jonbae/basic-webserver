@@ -288,11 +288,13 @@ pub extern "C" fn roc_dbg(bytes: *const u8, len: usize) {
 #[no_mangle]
 pub extern "C" fn roc_expect_failed(bytes: *const u8, len: usize) {
     DEBUG_OR_EXPECT_CALLED.store(true, Ordering::Release);
+    effect_ledger::expect_failed(unsafe { core::slice::from_raw_parts(bytes, len) });
     DefaultHandlers::roc_expect_failed(roc_host_ptr(), bytes, len);
 }
 
 #[no_mangle]
 pub extern "C" fn roc_crashed(bytes: *const u8, len: usize) {
+    effect_ledger::crashed(unsafe { core::slice::from_raw_parts(bytes, len) });
     DefaultHandlers::roc_crashed(roc_host_ptr(), bytes, len);
 }
 

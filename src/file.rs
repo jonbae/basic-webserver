@@ -28,11 +28,11 @@ use crate::time::system_time_from_unix_parts;
 const MAX_MATERIALIZED_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_FILE_READER_BUFFER_BYTES: u64 = 1024 * 1024;
 
+const FILE_MATERIALIZATION_LIMIT: &str =
+    "file read exceeded the 8 MiB materialization limit; use a buffered reader";
+
 fn file_materialization_limit_error(roc_host: &RocHost) -> IOErr {
-    crate::abi::io_err_other(
-        "file read exceeded the 8 MiB materialization limit; use a buffered reader",
-        roc_host,
-    )
+    crate::abi::io_err_other(FILE_MATERIALIZATION_LIMIT, roc_host)
 }
 
 fn read_file_bounded(path: std::path::PathBuf) -> io::Result<Vec<u8>> {
@@ -300,25 +300,35 @@ pub extern "C" fn hosted_file_read_bytes(path: HostFileReadBytesArgs) -> FileByt
 }
 
 #[no_mangle]
+// PROTOTYPE: hand-written ledger wrapper; codegen would emit these.
 pub extern "C" fn hosted_file_read_utf8(path: HostFileReadUtf8Args) -> FileStrResult {
     let roc_host = roc_host();
-    let path = match path_buf_from_raw_path(path, roc_host) {
-        Ok(path) => path,
-        Err(error) => return try_file_str_err(io_err_from_io(&error, roc_host)),
-    };
-    match read_file_bounded(path) {
-        Ok(bytes) if bytes.len() as u64 <= MAX_MATERIALIZED_FILE_BYTES => {
-            match String::from_utf8(bytes) {
-                Ok(content) => try_file_str_ok(RocStr::from_str(&content, roc_host)),
-                Err(error) => try_file_str_err(io_err_from_io(
-                    &io::Error::new(io::ErrorKind::InvalidData, error),
-                    roc_host,
-                )),
-            }
+    // Encode the request before path_buf_from_raw_path releases it.
+    let result = match effect_ledger::cross("hosted_file_read_utf8", || crate::ledger::encode_raw_path(&path)) {
+        effect_ledger::Cross::Replay(response) => {
+            // The real call would have consumed the argument; replay must too.
+            let _ = path_buf_from_raw_path(path, roc_host);
+            crate::ledger::decode_str_result(&response)
         }
-        Ok(_) => try_file_str_err(file_materialization_limit_error(roc_host)),
+        live => {
+            let result = file_read_utf8_io(path, roc_host);
+            live.record(|| crate::ledger::encode_str_result(&result));
+            result
+        }
+    };
+    match result {
+        Ok(content) => try_file_str_ok(RocStr::from_str(&content, roc_host)),
         Err(error) => try_file_str_err(io_err_from_io(&error, roc_host)),
     }
+}
+
+/// The real call, as the value Roc will see.
+fn file_read_utf8_io(path: HostFileReadUtf8Args, roc_host: &RocHost) -> io::Result<String> {
+    let bytes = read_file_bounded(path_buf_from_raw_path(path, roc_host)?)?;
+    if bytes.len() as u64 > MAX_MATERIALIZED_FILE_BYTES {
+        return Err(io::Error::other(FILE_MATERIALIZATION_LIMIT));
+    }
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 const MAX_OPEN_FILE_READERS: usize = 64;

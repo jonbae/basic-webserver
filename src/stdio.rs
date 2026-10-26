@@ -8,6 +8,7 @@ use crate::abi::{
     StdoutUnitResultTag,
 };
 use crate::roc_platform_abi::*;
+use effect_ledger::Cross;
 
 fn try_stdout_unit_ok() -> StdoutUnitResult {
     StdoutUnitResult {
@@ -76,9 +77,14 @@ fn try_stderr_bytes_err(error: IOErr) -> StderrBytesResult {
 #[no_mangle]
 pub extern "C" fn hosted_stdout_line(message: RocStr) -> StdoutUnitResult {
     let roc_host = roc_host();
-    let result = {
-        let mut stdout = io::stdout().lock();
-        writeln!(stdout, "{}", message.as_str())
+    // PROTOTYPE: hand-written ledger wrapper; codegen would emit these.
+    let result = match effect_ledger::cross("hosted_stdout_line", || message.as_str().as_bytes().to_vec()) {
+        Cross::Replay(response) => crate::ledger::decode_unit(&response),
+        live => {
+            let result = writeln!(io::stdout().lock(), "{}", message.as_str());
+            live.record(|| crate::ledger::encode_unit(&result));
+            result
+        }
     };
     unsafe { message.decref(roc_host) };
 
@@ -123,9 +129,14 @@ pub extern "C" fn hosted_stdout_write_bytes(bytes: RocListWith<u8, false>) -> St
 #[no_mangle]
 pub extern "C" fn hosted_stderr_line(message: RocStr) -> StderrUnitResult {
     let roc_host = roc_host();
-    let result = {
-        let mut stderr = io::stderr().lock();
-        writeln!(stderr, "{}", message.as_str())
+    // PROTOTYPE: wrapped too, because respond_for_host! reports an unhandled Err here.
+    let result = match effect_ledger::cross("hosted_stderr_line", || message.as_str().as_bytes().to_vec()) {
+        Cross::Replay(response) => crate::ledger::decode_unit(&response),
+        live => {
+            let result = writeln!(io::stderr().lock(), "{}", message.as_str());
+            live.record(|| crate::ledger::encode_unit(&result));
+            result
+        }
     };
     unsafe { message.decref(roc_host) };
 

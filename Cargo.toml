@@ -48,6 +48,8 @@ serde = { version = "=1.0.219", features = ["derive"] }
 serde_json = "=1.0.140"
 tokio = { version = "=1.45.0", features = ["rt", "rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tower-service = "=0.3.3"
+# PROTOTYPE: the effect ledger as a library
+effect-ledger = { path = "../effect-ledger" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.59.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }

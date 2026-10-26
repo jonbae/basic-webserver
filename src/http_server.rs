@@ -708,7 +708,9 @@ where
     F: FnOnce(ServerContext) -> Fut,
     Fut: std::future::Future<Output = ShutdownReason>,
 {
+    let ledger_request = effect_ledger::enter("init!", Vec::new);
     let mut init_result = unsafe { roc_init_for_host() };
+    ledger_request.leave(|| crate::ledger::encode_init(&init_result));
     let initialized = match init_result.tag {
         InitForHostResultTag::Ok => unsafe { init_result.take_payload_ok_unchecked() },
         InitForHostResultTag::Err => {
@@ -831,7 +833,9 @@ fn finish_shutdown(reason: ShutdownReason, context: RocBox, hook_timeout: Durati
         })
         .expect("failed to start shutdown watchdog");
 
+    let ledger_request = effect_ledger::enter("shutdown!", || crate::ledger::encode_shutdown_request(&raw_reason));
     let mut result = unsafe { roc_shutdown_for_host(raw_reason, context) };
+    ledger_request.leave(|| crate::ledger::encode_shutdown_result(&result));
     let _ = finished_sender.send(());
     let _ = watchdog.join();
 
@@ -1106,7 +1110,9 @@ fn call_roc(
     response_semantics: &RequestSemantics,
 ) -> (RocOutcome, Duration) {
     let started = Instant::now();
+    let ledger_request = effect_ledger::enter("respond!", || crate::ledger::encode_request(&request));
     let response = unsafe { roc_respond_for_host(request, context) };
+    ledger_request.leave(|| crate::ledger::encode_response(&response));
     let roc_duration = started.elapsed();
     (
         outcome_from_roc(response, accepted_encodings, response_semantics),

@@ -49,15 +49,29 @@ pub(crate) fn system_time_from_unix_parts(
     }
 }
 
+// PROTOTYPE: hand-written ledger wrappers; codegen would emit these.
 #[no_mangle]
 pub extern "C" fn hosted_unix_time_now() -> i128 {
-    nanos_since_unix_epoch(SystemTime::now())
-        .expect("current system time is outside the signed nanosecond range")
+    match effect_ledger::cross("hosted_unix_time_now", Vec::new) {
+        effect_ledger::Cross::Replay(response) => i128::from_le_bytes(response.try_into().unwrap()),
+        live => {
+            let nanos = nanos_since_unix_epoch(SystemTime::now())
+                .expect("current system time is outside the signed nanosecond range");
+            live.record(|| nanos.to_le_bytes().to_vec());
+            nanos
+        }
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn hosted_sleep_millis(millis: u64) {
-    std::thread::sleep(std::time::Duration::from_millis(millis));
+    match effect_ledger::cross("hosted_sleep_millis", || millis.to_le_bytes().to_vec()) {
+        effect_ledger::Cross::Replay(_) => {}
+        live => {
+            std::thread::sleep(std::time::Duration::from_millis(millis));
+            live.record(Vec::new);
+        }
+    }
 }
 
 #[cfg(test)]
